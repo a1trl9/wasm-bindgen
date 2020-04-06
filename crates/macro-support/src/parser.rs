@@ -1048,6 +1048,10 @@ impl<'a> MacroParse<(&'a mut TokenStream, BindgenAttrs)> for syn::ItemEnum {
             bail_span!(self, "cannot export empty enums to JS");
         }
         let generate_typescript = opts.skip_typescript().is_none();
+        let js_name = opts
+            .js_name()
+            .map(|s| s.0.to_string())
+            .unwrap_or(self.ident.to_string());
         opts.check_used()?;
 
         // Check if the first value is a string literal
@@ -1145,7 +1149,8 @@ impl<'a> MacroParse<(&'a mut TokenStream, BindgenAttrs)> for syn::ItemEnum {
         self.to_tokens(tokens);
 
         program.enums.push(ast::Enum {
-            name: self.ident,
+            rust_name: self.ident,
+            js_name,
             variants,
             comments,
             hole,
