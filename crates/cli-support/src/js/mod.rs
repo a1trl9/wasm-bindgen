@@ -66,9 +66,9 @@ pub struct ExportedClass {
     is_inspectable: bool,
     /// All readable properties of the class
     readable_properties: Vec<String>,
-    /// Map from field name to type as a string plus whether it has a setter
+    /// Map from field name to type as a string, docs plus whether it has a setter
     /// and it is optional
-    typescript_fields: HashMap<String, (String, bool, bool)>,
+    typescript_fields: HashMap<String, (String, String, bool, bool)>,
 }
 
 const INITIAL_HEAP_VALUES: &[&str] = &["undefined", "null", "true", "false"];
@@ -798,7 +798,8 @@ impl<'a> Context<'a> {
         let mut fields = class.typescript_fields.keys().collect::<Vec<_>>();
         fields.sort(); // make sure we have deterministic output
         for name in fields {
-            let (ty, has_setter, is_optional) = &class.typescript_fields[name];
+            let (ty, docs, has_setter, is_optional) = &class.typescript_fields[name];
+            ts_dst.push_str(docs);
             ts_dst.push_str("  ");
             if !has_setter {
                 ts_dst.push_str("readonly ");
@@ -816,6 +817,7 @@ impl<'a> Context<'a> {
         ts_dst.push_str("}\n");
 
         self.export(&name, &dst, Some(&class.comments))?;
+        self.typescript.push_str(&class.comments);
         self.typescript.push_str(&ts_dst);
 
         Ok(())
@@ -1994,7 +1996,13 @@ impl<'a> Context<'a> {
                 format!("l{}", name)
             }
 
-            JsImportName::Global { name } => self.generate_identifier(name),
+            JsImportName::Global { name } => {
+                let unique_name = self.generate_identifier(name);
+                if unique_name != *name {
+                    bail!("cannot import `{}` from two locations", name);
+                }
+                unique_name
+            }
         };
         self.imported_names
             .insert(import.name.clone(), name.clone());
@@ -2076,42 +2084,24 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
+    /// Registers import names for all `Global` imports first before we actually
+    /// process any adapters.
+    ///
+    /// `Global` names must be imported as their exact name, so if the same name
+    /// from a global is also imported from a module we have to be sure to
+    /// import the global first to ensure we don't shadow the actual global
+    /// value. Otherwise we have no way of accessing the global value!
+    ///
+    /// This function will iterate through the import map up-front and generate
+    /// a cache entry for each import name which is a `Global`.
     fn prestore_global_import_identifiers(&mut self) -> Result<(), Error> {
-        for (_id, adapter) in crate::sorted_iter(&self.wit.adapters) {
-            let instrs = match &adapter.kind {
-                AdapterKind::Import { .. } => continue,
-                AdapterKind::Local { instructions } => instructions,
+        for import in self.aux.import_map.values() {
+            let js = match import {
+                AuxImport::Value(AuxValue::Bare(js)) => js,
+                _ => continue,
             };
-            let mut call = None;
-            for instr in instrs {
-                match instr.instr {
-                    Instruction::CallAdapter(id) => {
-                        if call.is_some() {
-                            continue;
-                        } else {
-                            call = Some(id);
-                        }
-                    }
-                    Instruction::CallExport(_)
-                    | Instruction::CallTableElement(_)
-                    | Instruction::Standard(wit_walrus::Instruction::CallCore(_))
-                    | Instruction::Standard(wit_walrus::Instruction::CallAdapter(_)) => continue,
-                    _ => {}
-                }
-            }
-            if let Some(id) = call {
-                let js = match &self.aux.import_map[&id] {
-                    AuxImport::Value(AuxValue::Bare(js)) => Some(js),
-                    _ => None,
-                };
-                if let Some(js) = js {
-                    match &js.name {
-                        JsImportName::Global { .. } => {
-                            self.import_name(js)?;
-                        }
-                        _ => {}
-                    }
-                }
+            if let JsImportName::Global { .. } = js.name {
+                self.import_name(js)?;
             }
         }
         Ok(())
@@ -2936,10 +2926,23 @@ impl<'a> Context<'a> {
             self.typescript
                 .push_str(&format!("export enum {} {{", enum_.name));
         }
-        for (name, value) in enum_.variants.iter() {
+        for (name, value, comments) in enum_.variants.iter() {
+            let variant_docs = if comments.is_empty() {
+                String::new()
+            } else {
+                format_doc_comments(&comments, None)
+            };
+            if !variant_docs.is_empty() {
+                variants.push_str("\n");
+                variants.push_str(&variant_docs);
+            }
             variants.push_str(&format!("{}:{},", name, value));
             if enum_.generate_typescript {
-                self.typescript.push_str(&format!("\n  {},", name));
+                self.typescript.push_str("\n");
+                if !variant_docs.is_empty() {
+                    self.typescript.push_str(&variant_docs);
+                }
+                self.typescript.push_str(&format!("  {},", name));
             }
         }
         if enum_.generate_typescript {
@@ -3265,7 +3268,7 @@ impl ExportedClass {
     fn push_getter(&mut self, docs: &str, field: &str, js: &str, ret_ty: Option<&str>) {
         self.push_accessor(docs, field, js, "get ");
         if let Some(ret_ty) = ret_ty {
-            self.push_accessor_ts(field, ret_ty);
+            self.push_accessor_ts(docs, field, ret_ty, false);
         }
         self.readable_properties.push(field.to_string());
     }
@@ -3282,20 +3285,30 @@ impl ExportedClass {
     ) {
         self.push_accessor(docs, field, js, "set ");
         if let Some(ret_ty) = ret_ty {
-            let (has_setter, is_optional) = self.push_accessor_ts(field, ret_ty);
-            *has_setter = true;
+            let is_optional = self.push_accessor_ts(docs, field, ret_ty, true);
             *is_optional = might_be_optional_field;
         }
     }
 
-    fn push_accessor_ts(&mut self, field: &str, ret_ty: &str) -> (&mut bool, &mut bool) {
-        let (ty, has_setter, is_optional) = self
+    fn push_accessor_ts(
+        &mut self,
+        docs: &str,
+        field: &str,
+        ret_ty: &str,
+        is_setter: bool,
+    ) -> &mut bool {
+        let (ty, accessor_docs, has_setter, is_optional) = self
             .typescript_fields
             .entry(field.to_string())
             .or_insert_with(Default::default);
 
         *ty = ret_ty.to_string();
-        (has_setter, is_optional)
+        // Deterministic output: always use the getter's docs if available
+        if !docs.is_empty() && (accessor_docs.is_empty() || !is_setter) {
+            *accessor_docs = docs.to_owned();
+        }
+        *has_setter |= is_setter;
+        is_optional
     }
 
     fn push_accessor(&mut self, docs: &str, field: &str, js: &str, prefix: &str) {
